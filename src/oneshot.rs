@@ -1,19 +1,18 @@
 use std::marker::PhantomData;
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::Thread;
+use std::sync::{Mutex, Condvar};
 
 struct OneShot<T> {
-    thread: Thread,
-    is_set: AtomicBool,
+    cvar: Condvar,
+    is_set: Mutex<bool>,
     value: UnsafeCell<Option<T>>,
 }
 
 impl<T> OneShot<T> {
     fn wait_for_is_set(&self) {
-        while !self.is_set.load(Ordering::SeqCst) {
-            std::thread::park();
-        }
+        let guard = self.is_set.lock().unwrap();
+        // We don't need the returned mutex guard
+        drop(self.cvar.wait_while(guard, |is_set| !*is_set ).unwrap());
     }
 }
 
@@ -29,34 +28,21 @@ pub struct ScopedSender<T> {
     // We ensure validity of the pointer by making sure that Scope that contains OneShot
     // lives until Sender signals that the value is set
     tx: *const OneShot<T>,
-    sent: bool,
 }
 
 unsafe impl<T: Send> Send for ScopedSender<T> {}
 
 impl<T> ScopedSender<T> {
-    pub fn send(mut self, val: T)
+    pub fn send(self, val: T)
     where
         T: Send,
     {
         unsafe {
             // OneShotReceiver doesn't read value until is_set is true
             *(*self.tx).value.get() = Some(val);
-            (*self.tx).is_set.store(true, Ordering::SeqCst);
-            (*self.tx).thread.unpark();
-        }
-        self.sent = true;
-    }
-}
-
-impl<T> Drop for ScopedSender<T> {
-    fn drop(&mut self) {
-        unsafe {
-            // If send() was called, the tx pointer might be invalid
-            if !self.sent {
-                (*self.tx).is_set.store(true, Ordering::SeqCst);
-                (*self.tx).thread.unpark();
-            }
+            let mut is_set_guard = (*self.tx).is_set.lock().unwrap();
+            *is_set_guard = true;
+            (*self.tx).cvar.notify_one();
         }
     }
 }
@@ -65,6 +51,13 @@ pub struct ScopedReceiver<'scope, T> {
     rx: &'scope OneShot<T>,
     // Not send
     _ph: PhantomData<*mut T>,
+}
+
+impl<'scope, T> Drop for ScopedReceiver<'scope, T> {
+    fn drop(&mut self) {
+        // make sure that `OneShot` is alive until `is_set` is true
+        self.rx.wait_for_is_set();
+    }
 }
 
 impl<'scope, T> ScopedReceiver<'scope, T> {
@@ -85,22 +78,19 @@ where
     R: Send,
 {
     let scope = Scope {
-        oneshot: OneShot { thread: std::thread::current(),
-            is_set: AtomicBool::new(false),
+        oneshot: OneShot { 
+            cvar: Condvar::new(),
+            is_set: Mutex::new(false),
             value: UnsafeCell::new(None),
         },
         scope: PhantomData,
     };
     let scoped_sender = ScopedSender {
         tx: &scope.oneshot,
-        sent: false,
     };
     let scoped_receiver = ScopedReceiver {
         rx: &scope.oneshot,
         _ph: PhantomData,
     };
-    let r = f(scoped_sender, scoped_receiver);
-    // make sure that scope.oneshot is alive until the value is actually set
-    scope.oneshot.wait_for_is_set();
-    r
+    f(scoped_sender, scoped_receiver)
 }
